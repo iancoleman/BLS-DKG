@@ -8,7 +8,7 @@
 // Software.
 
 use super::encryptor::{Iv, Key};
-use super::{Acknowledgment, Part};
+use super::{Acknowledgment, Contribution};
 use crate::id::PublicId;
 use serde_derive::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -24,9 +24,9 @@ pub enum Message<P: PublicId> {
         n: usize,
         member_list: BTreeSet<P>,
     },
-    Proposal {
+    Contribution {
         key_gen_id: u64,
-        part: Part,
+        contribution: Contribution,
     },
     Complaint {
         key_gen_id: u64,
@@ -55,7 +55,7 @@ impl<P: PublicId> fmt::Debug for Message<P> {
                 "Initialization({:?} - {:?})",
                 member_list, key_gen_id
             ),
-            Message::Proposal { key_gen_id, .. } => write!(formatter, "Proposal({})", key_gen_id),
+            Message::Contribution { key_gen_id, .. } => write!(formatter, "Contribution({})", key_gen_id),
             Message::Complaint {
                 key_gen_id, target, ..
             } => write!(formatter, "Complaint({} - {})", key_gen_id, target),

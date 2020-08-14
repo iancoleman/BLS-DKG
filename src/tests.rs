@@ -139,7 +139,7 @@ mod test {
         // Check for Phases, Contributions and Readiness
         for member in members.iter_mut().take(NODE_NUM) {
             assert!(member.all_contribution_received().unwrap());
-            assert_eq!(Phase::Finalization, member.phase().unwrap());
+            assert_eq!(Phase::Finalize, member.phase().unwrap());
             assert!(member.is_ready().unwrap());
         }
 

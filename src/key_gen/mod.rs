@@ -60,8 +60,8 @@ pub enum Error {
     #[error(display = "Unexpected phase")]
     UnexpectedPhase { expected: Phase, actual: Phase },
     /// Ack on a missed part.
-    #[error(display = "ACK on missed part")]
-    MissingPart,
+    #[error(display = "ACK on missed contribution")]
+    MissingContribution,
 }
 
 impl From<Box<bincode::ErrorKind>> for Error {
@@ -70,24 +70,24 @@ impl From<Box<bincode::ErrorKind>> for Error {
     }
 }
 
-/// A contribution by a node for the key generation. The part shall only be handled by the receiver.
+/// A contribution by a node for the key generation. The contribution shall only be handled by the receiver.
 #[derive(Deserialize, Serialize, Clone, Hash, Eq, PartialEq, PartialOrd, Ord)]
-pub struct Part {
-    // Index of the peer that expected to receive this Part.
-    receiver: u64,
-    // Our poly-commitment.
-    commitment: BivarCommitment,
-    // serialized row for the receiver.
+pub struct Contribution {
+    // Index of the peer that expected to receive this Contribution.
+    consumer: u64,
+    // Poly-commitment for the consumer to consume.
+    consumable_commitment: BivarCommitment,
+    // serialized row for the consumer.
     ser_row: Vec<u8>,
-    // Encrypted rows from the sender.
+    // Encrypted rows from the creator.
     enc_rows: Vec<Vec<u8>>,
 }
 
-impl Debug for Part {
+impl Debug for Contribution {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_tuple("Part")
-            .field(&format!("<receiver {}>", &self.receiver))
-            .field(&format!("<degree {}>", self.commitment.degree()))
+            .field(&format!("<consumer {}>", &self.consumer))
+            .field(&format!("<degree {}>", self.consumable_commitment.degree()))
             .field(&format!("<{} rows>", self.enc_rows.len()))
             .finish()
     }
@@ -96,7 +96,7 @@ impl Debug for Part {
 /// A confirmation that we have received and verified a validator's part. It must be sent to
 /// all participating nodes and handled by all of them, including ourselves.
 ///
-/// The message is only produced after we verified our row against the ack in the `Part`.
+/// The message is only produced after we verified our row against the ack in the `Contribution`.
 /// For each node, it contains `proposal_index, receiver_index, serialised value for the receiver,
 /// encrypted values from the sender`.
 #[derive(Deserialize, Serialize, Clone, Hash, Eq, PartialEq, PartialOrd, Ord)]
@@ -112,25 +112,25 @@ impl Debug for Acknowledgment {
     }
 }
 
-/// The information needed to track a single proposer's secret sharing process.
+/// The information needed to track a single contributor's secret sharing process.
 #[derive(Debug, PartialEq, Eq)]
-struct ProposalState {
-    /// The proposer's commitment.
-    commitment: BivarCommitment,
+struct ContributionTracker {
+    /// The contributors commitment.
+    commitment_from_contribution: BivarCommitment,
     /// The verified values we received from `Acknowledgment` messages.
-    values: BTreeMap<u64, Fr>,
-    /// The encrypted values received from the proposor.
+    verified_values: BTreeMap<u64, Fr>,
+    /// The encrypted values received from the contributor.
     enc_values: Vec<Vec<u8>>,
     /// The nodes which have committed.
     acks: BTreeSet<u64>,
 }
 
-impl ProposalState {
+impl ContributionTracker {
     /// Creates a new part state with a commitment.
-    fn new(commitment: BivarCommitment) -> ProposalState {
-        ProposalState {
-            commitment,
-            values: BTreeMap::new(),
+    fn new(commitment_from_contribution: BivarCommitment) -> ContributionTracker {
+        ContributionTracker {
+            commitment_from_contribution,
+            verified_values: BTreeMap::new(),
             enc_values: Vec::new(),
             acks: BTreeSet::new(),
         }
@@ -141,13 +141,13 @@ impl ProposalState {
     }
 }
 
-impl<'a> serde::Deserialize<'a> for ProposalState {
+impl<'a> serde::Deserialize<'a> for ContributionTracker {
     fn deserialize<D: serde::Deserializer<'a>>(deserializer: D) -> Result<Self, D::Error> {
-        let (commitment, values, enc_values, acks) = serde::Deserialize::deserialize(deserializer)?;
-        let values: Vec<(u64, FieldWrap<Fr>)> = values;
+        let (commitment_from_contribution, verified_values, enc_values, acks) = serde::Deserialize::deserialize(deserializer)?;
+        let verified_values: Vec<(u64, FieldWrap<Fr>)> = verified_values;
         Ok(Self {
-            commitment,
-            values: values
+            commitment_from_contribution,
+            verified_values: verified_values
                 .into_iter()
                 .map(|(index, fr)| (index, fr.0))
                 .collect(),
@@ -157,24 +157,24 @@ impl<'a> serde::Deserialize<'a> for ProposalState {
     }
 }
 
-/// The outcome of handling and verifying a `Part` message.
-pub enum PartOutcome {
+/// The outcome of handling and verifying a `Contribution` message.
+pub enum ContributionOutcome {
     /// The message was valid: the part of it that was encrypted to us matched the public
     /// ack, so we can multicast an `Acknowledgment` message for it. If we have already handled the
-    /// same `Part` before, this contains `None` instead.
+    /// same `Contribution` before, this contains `None` instead.
     Valid(Option<Acknowledgment>),
-    /// The message was invalid: We now know that the proposer is faulty.
-    Invalid(PartFault),
+    /// The message was invalid: We now know that the contributor is faulty.
+    Invalid(ContributionFault),
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 pub enum Phase {
-    Initialization,
-    Contribution,
-    Complaining,
-    Justification,
-    Commitment,
-    Finalization,
+    Initialize,
+    Contribute,
+    Complain,
+    Justify,
+    Combine,
+    Finalize,
 }
 
 #[derive(Default)]
@@ -303,8 +303,8 @@ pub struct KeyGen<S: SecretId> {
     pub_keys: BTreeSet<S::PublicId>,
     /// Carry out encryption work during the DKG process.
     encryptor: Encryptor<S::PublicId>,
-    /// Proposed bivariate polynomials.
-    parts: BTreeMap<u64, ProposalState>,
+    /// Proposed bivariate polynomials that must be tracked for validity and acknowledgement.
+    contribution_trackers: BTreeMap<u64, ContributionTracker>,
     /// The degree of the generated polynomial.
     threshold: usize,
     /// Current DKG phase.
@@ -342,9 +342,9 @@ impl<S: SecretId> KeyGen<S> {
             our_index,
             pub_keys: pub_keys.clone(),
             encryptor: Encryptor::new(&pub_keys),
-            parts: BTreeMap::new(),
+            contribution_trackers: BTreeMap::new(),
             threshold,
-            phase: Phase::Initialization,
+            phase: Phase::Initialize,
             initalization_accumulator: InitializationAccumulator::new(),
             complaints_accumulator: ComplaintsAccumulator::new(pub_keys.clone(), threshold),
             pending_complain_messages: Vec::new(),
@@ -381,7 +381,7 @@ impl<S: SecretId> KeyGen<S> {
                 msgs.extend(self.poll_pending_messages(rng));
                 Ok(msgs)
             }
-            Err(Error::UnexpectedPhase { .. }) | Err(Error::MissingPart) => {
+            Err(Error::UnexpectedPhase { .. }) | Err(Error::MissingContribution) => {
                 self.pending_messags.push(msg);
                 Ok(Vec::new())
             }
@@ -421,7 +421,7 @@ impl<S: SecretId> KeyGen<S> {
                 n,
                 member_list,
             } => self.handle_initialization(rng, m, n, key_gen_id, member_list),
-            Message::Proposal { key_gen_id, part } => self.handle_proposal(key_gen_id, part),
+            Message::Contribution { key_gen_id, contribution } => self.handle_contribution(key_gen_id, contribution),
             Message::Complaint {
                 key_gen_id,
                 target,
@@ -445,9 +445,9 @@ impl<S: SecretId> KeyGen<S> {
         sender: u64,
         member_list: BTreeSet<S::PublicId>,
     ) -> Result<Vec<Message<S::PublicId>>, Error> {
-        if self.phase != Phase::Initialization {
+        if self.phase != Phase::Initialize {
             return Err(Error::UnexpectedPhase {
-                expected: Phase::Initialization,
+                expected: Phase::Initialize,
                 actual: self.phase,
             });
         }
@@ -458,13 +458,13 @@ impl<S: SecretId> KeyGen<S> {
         {
             self.threshold = m;
             self.pub_keys = member_list;
-            self.phase = Phase::Contribution;
+            self.phase = Phase::Contribute;
 
             let mut rng = rng_adapter::RngAdapter(&mut *rng);
-            let our_part = BivarPoly::random(self.threshold, &mut rng);
-            let ack = our_part.commitment();
+            let our_contribution = BivarPoly::random(self.threshold, &mut rng);
+            let our_commitment = our_contribution.commitment();
             let encrypt = |(i, pk): (usize, &S::PublicId)| {
-                let row = our_part.row(i + 1);
+                let row = our_contribution.row(i + 1);
                 self.encryptor.encrypt(pk, &serialize(&row)?)
             };
             let rows = self
@@ -478,12 +478,12 @@ impl<S: SecretId> KeyGen<S> {
                 .iter()
                 .enumerate()
                 .map(|(idx, _pk)| {
-                    let ser_row = serialize(&our_part.row(idx + 1))?;
-                    Ok(Message::Proposal {
+                    let ser_row = serialize(&our_contribution.row(idx + 1))?;
+                    Ok(Message::Contribution {
                         key_gen_id: self.our_index,
-                        part: Part {
-                            receiver: idx as u64,
-                            commitment: ack.clone(),
+                        contribution: Contribution {
+                            consumer: idx as u64,
+                            consumable_commitment: our_commitment.clone(),
                             ser_row,
                             enc_rows: rows.clone(),
                         },
@@ -495,51 +495,51 @@ impl<S: SecretId> KeyGen<S> {
         Ok(Vec::new())
     }
 
-    // Handles a `Proposal` message during the `Contribution` phase.
+    // Handles a `Contribution` message during the `Contribution` phase.
     // When there is an invalidation happens, holds the `Complaint` message till broadcast out
     // when `finalize_contributing` being called.
-    fn handle_proposal(
+    fn handle_contribution(
         &mut self,
         sender_index: u64,
-        part: Part,
+        contribution: Contribution,
     ) -> Result<Vec<Message<S::PublicId>>, Error> {
-        if !(self.phase == Phase::Contribution || self.phase == Phase::Commitment) {
+        if !(self.phase == Phase::Contribute || self.phase == Phase::Combine) {
             return Err(Error::UnexpectedPhase {
-                expected: Phase::Contribution,
+                expected: Phase::Contribute,
                 actual: self.phase,
             });
         }
 
-        let row = match self.handle_part_or_fault(sender_index, part.clone()) {
+        let row = match self.handle_contribution_or_fault(sender_index, contribution.clone()) {
             Ok(Some(row)) => row,
             Ok(None) => return Ok(Vec::new()),
             Err(_fault) => {
-                let msg = Message::Proposal::<S::PublicId> {
+                let msg = Message::Contribution::<S::PublicId> {
                     key_gen_id: sender_index,
-                    part,
+                    contribution,
                 };
                 debug!(
                     "{:?} complain {:?} with Error {:?}",
                     self, sender_index, _fault
                 );
-                let invalid_contribute = serialize(&msg)?;
+                let invalid_contribution = serialize(&msg)?;
                 self.pending_complain_messages.push(Message::Complaint {
                     key_gen_id: self.our_index,
                     target: sender_index,
-                    msg: invalid_contribute,
+                    msg: invalid_contribution,
                 });
                 return Ok(Vec::new());
             }
         };
 
         // The row is valid. Encrypt one value for each node and broadcast `Acknowledgment`.
-        let mut values = Vec::new();
+        let mut verified_values = Vec::new();
         let mut enc_values = Vec::new();
         for (index, pk) in self.pub_keys.iter().enumerate() {
             let val = row.evaluate(index + 1);
             let ser_val = serialize(&FieldWrap(val))?;
             enc_values.push(self.encryptor.encrypt(pk, &ser_val)?);
-            values.push(ser_val);
+            verified_values.push(ser_val);
         }
 
         let result = self
@@ -551,7 +551,7 @@ impl<S: SecretId> KeyGen<S> {
                 ack: Acknowledgment(
                     sender_index,
                     idx as u64,
-                    values[idx].clone(),
+                    verified_values[idx].clone(),
                     enc_values.clone(),
                 ),
             })
@@ -567,29 +567,29 @@ impl<S: SecretId> KeyGen<S> {
         sender_index: u64,
         ack: Acknowledgment,
     ) -> Result<Vec<Message<S::PublicId>>, Error> {
-        if !(self.phase == Phase::Contribution || self.phase == Phase::Commitment) {
+        if !(self.phase == Phase::Contribute || self.phase == Phase::Combine) {
             return Err(Error::UnexpectedPhase {
-                expected: Phase::Contribution,
+                expected: Phase::Contribute,
                 actual: self.phase,
             });
         }
         match self.handle_ack_or_fault(sender_index, ack.clone()) {
             Ok(()) => {
                 if self.all_contribution_received() {
-                    if self.phase == Phase::Commitment {
+                    if self.phase == Phase::Combine {
                         self.become_finalization();
                     } else {
                         return self.finalize_contributing_phase();
                     }
                 }
             }
-            Err(AcknowledgmentFault::MissingPart) => {
+            Err(AcknowledgmentFault::MissingContribution) => {
                 debug!(
-                    "{:?} MissingPart on Ack not causing a complain, /
+                    "{:?} MissingContribution on Ack not causing a complain, /
                         return with error to trigger an outside cache",
                     self
                 );
-                return Err(Error::MissingPart);
+                return Err(Error::MissingContribution);
             }
             Err(fault) => {
                 let msg = Message::<S::PublicId>::Acknowledgment {
@@ -613,15 +613,15 @@ impl<S: SecretId> KeyGen<S> {
     }
 
     pub fn all_contribution_received(&self) -> bool {
-        self.pub_keys.len() == self.parts.len()
+        self.pub_keys.len() == self.contribution_trackers.len()
             && self
-                .parts
+                .contribution_trackers
                 .values()
                 .all(|part| part.acks.len() == self.pub_keys.len())
     }
 
     fn finalize_contributing_phase(&mut self) -> Result<Vec<Message<S::PublicId>>, Error> {
-        self.phase = Phase::Complaining;
+        self.phase = Phase::Complain;
 
         for non_contributor in self.non_contributors().0 {
             debug!(
@@ -656,8 +656,8 @@ impl<S: SecretId> KeyGen<S> {
         let mut non_ids = BTreeSet::new();
         let mut missing_times = BTreeMap::new();
         for (idx, id) in self.pub_keys.iter().enumerate() {
-            if let Some(proposal_sate) = self.parts.get(&(idx as u64)) {
-                if !proposal_sate.acks.contains(&(idx as u64)) {
+            if let Some(contribution_tracker) = self.contribution_trackers.get(&(idx as u64)) {
+                if !contribution_tracker.acks.contains(&(idx as u64)) {
                     let times = missing_times.entry(idx).or_insert_with(|| 0);
                     *times += 1;
                     if *times > self.pub_keys.len() / 2 {
@@ -683,30 +683,30 @@ impl<S: SecretId> KeyGen<S> {
     ) -> Result<Vec<Message<S::PublicId>>, Error> {
         debug!("{:?} current phase is {:?}", self, self.phase);
         match self.phase {
-            Phase::Contribution => match self.finalize_contributing_phase() {
+            Phase::Contribute => match self.finalize_contributing_phase() {
                 Ok(mut messages) => {
                     messages.extend(self.poll_pending_messages(rng));
                     Ok(messages)
                 }
                 Err(err) => Err(err),
             },
-            Phase::Complaining => match self.finalize_complaining_phase(rng) {
+            Phase::Complain=> match self.finalize_complaining_phase(rng) {
                 Ok(mut messages) => {
                     messages.extend(self.poll_pending_messages(rng));
                     Ok(messages)
                 }
                 Err(err) => Err(err),
             },
-            Phase::Initialization => Err(Error::UnexpectedPhase {
-                expected: Phase::Contribution,
+            Phase::Initialize => Err(Error::UnexpectedPhase {
+                expected: Phase::Contribute,
                 actual: self.phase,
             }),
-            Phase::Commitment | Phase::Justification => Err(Error::UnexpectedPhase {
-                expected: Phase::Complaining,
+            Phase::Combine | Phase::Justify => Err(Error::UnexpectedPhase {
+                expected: Phase::Complain,
                 actual: self.phase,
             }),
 
-            Phase::Finalization => Ok(Vec::new()),
+            Phase::Finalize => Ok(Vec::new()),
         }
     }
 
@@ -717,9 +717,9 @@ impl<S: SecretId> KeyGen<S> {
         target_index: u64,
         invalid_msg: Vec<u8>,
     ) -> Result<Vec<Message<S::PublicId>>, Error> {
-        if self.phase != Phase::Complaining {
+        if self.phase != Phase::Complain {
             return Err(Error::UnexpectedPhase {
-                expected: Phase::Complaining,
+                expected: Phase::Complain,
                 actual: self.phase,
             });
         }
@@ -764,7 +764,7 @@ impl<S: SecretId> KeyGen<S> {
         //       phase to wait for the accused member send us the encryption keys to recover.
         //       However, the accusation could also be `non-contribution`, which disables recovery.
         //       So currently we skip the Justification phase, assuming all the consensused
-        //       complained members are really invalid, and transit into the Commitment phase to
+        //       complained members are really invalid, and transit into the Combination phase to
         //       start a new round of DKG without the complained members.
 
         if !failings.is_empty() {
@@ -777,14 +777,14 @@ impl<S: SecretId> KeyGen<S> {
             return Ok(Vec::new());
         }
 
-        self.phase = Phase::Commitment;
-        self.parts = BTreeMap::new();
+        self.phase = Phase::Combine;
+        self.contribution_trackers = BTreeMap::new();
 
         let mut rng = rng_adapter::RngAdapter(&mut *rng);
-        let our_part = BivarPoly::random(self.threshold, &mut rng);
-        let justify = our_part.commitment();
+        let our_contribution = BivarPoly::random(self.threshold, &mut rng);
+        let justify_commitment = our_contribution.commitment();
         let encrypt = |(i, pk): (usize, &S::PublicId)| {
-            let row = our_part.row(i + 1);
+            let row = our_contribution.row(i + 1);
             self.encryptor.encrypt(pk, &serialize(&row)?)
         };
         let rows = self
@@ -795,12 +795,12 @@ impl<S: SecretId> KeyGen<S> {
             .collect::<Result<Vec<_>, Error>>()?;
 
         self.pub_keys.iter().enumerate().for_each(|(idx, _pk)| {
-            if let Ok(ser_row) = serialize(&our_part.row(idx + 1)) {
-                result.push(Message::Proposal {
+            if let Ok(ser_row) = serialize(&our_contribution.row(idx + 1)) {
+                result.push(Message::Contribution {
                     key_gen_id: self.our_index,
-                    part: Part {
-                        receiver: idx as u64,
-                        commitment: justify.clone(),
+                    contribution: Contribution {
+                        consumer: idx as u64,
+                        consumable_commitment: justify_commitment.clone(),
                         ser_row,
                         enc_rows: rows.clone(),
                     },
@@ -822,7 +822,7 @@ impl<S: SecretId> KeyGen<S> {
     }
 
     fn become_finalization(&mut self) {
-        self.phase = Phase::Finalization;
+        self.phase = Phase::Finalize;
         self.pending_messags.clear();
         self.pending_complain_messages.clear();
     }
@@ -845,23 +845,23 @@ impl<S: SecretId> KeyGen<S> {
         None
     }
 
-    /// Returns the number of complete parts. If this is at least `threshold + 1`, the keys can
+    /// Returns the number of complete contributions. If this is at least `threshold + 1`, the keys can
     /// be generated, but it is possible to wait for more to increase security.
     fn complete_parts_count(&self) -> usize {
-        self.parts
+        self.contribution_trackers
             .values()
-            .filter(|part| part.is_complete(self.threshold))
+            .filter(|contribution_tracker| contribution_tracker.is_complete(self.threshold))
             .count()
     }
 
-    // Returns `true` if all parts are complete to safely generate the new key.
+    // Returns `true` if all contributions are complete to safely generate the new key.
     fn is_ready(&self) -> bool {
         self.complete_parts_count() == self.pub_keys.len()
     }
 
     /// Returns `true` if in the phase of Finalization.
     pub fn is_finalized(&self) -> bool {
-        self.phase == Phase::Finalization
+        self.phase == Phase::Finalize
     }
 
     /// Returns the new secret key share and the public key set.
@@ -872,10 +872,10 @@ impl<S: SecretId> KeyGen<S> {
 
         let mut pk_commitment = Poly::zero().commitment();
         let mut sk_val = Fr::zero();
-        let is_complete = |part: &&ProposalState| part.is_complete(self.threshold);
-        for part in self.parts.values().filter(is_complete) {
-            pk_commitment += part.commitment.row(0);
-            let row = Poly::interpolate(part.values.iter().take(self.threshold + 1));
+        let is_complete = |contribution_tracker: &&ContributionTracker| contribution_tracker.is_complete(self.threshold);
+        for contribution_tracker in self.contribution_trackers.values().filter(is_complete) {
+            pk_commitment += contribution_tracker.commitment_from_contribution.row(0);
+            let row = Poly::interpolate(contribution_tracker.verified_values.iter().take(self.threshold + 1));
             sk_val.add_assign(&row.evaluate(0));
         }
         let sk = SecretKeyShare::from_mut(&mut sk_val);
@@ -891,7 +891,7 @@ impl<S: SecretId> KeyGen<S> {
     pub fn possible_blockers(&self) -> BTreeSet<S::PublicId> {
         let mut result = BTreeSet::new();
         match self.phase {
-            Phase::Initialization => {
+            Phase::Initialize => {
                 for (index, pk) in self.pub_keys.iter().enumerate() {
                     if !self
                         .initalization_accumulator
@@ -902,62 +902,62 @@ impl<S: SecretId> KeyGen<S> {
                     }
                 }
             }
-            Phase::Contribution => result = self.non_contributors().1,
-            Phase::Complaining => {
+            Phase::Contribute => result = self.non_contributors().1,
+            Phase::Complain => {
                 // Non-voters shall already be returned within the error of the
                 // finalize_complaint_phase function call.
             }
-            Phase::Justification | Phase::Commitment => {
+            Phase::Justify | Phase::Combine => {
                 // As Complaint phase gets completed, it is expected that all nodes are now
                 // in these two phases. Hence here a strict rule is undertaken that: any missing
                 // vote will be considered as a potential non-voter.
-                for part in self.parts.values() {
+                for contribution_tracker in self.contribution_trackers.values() {
                     for (index, pk) in self.pub_keys.iter().enumerate() {
-                        if !part.acks.contains(&(index as u64)) {
+                        if !contribution_tracker.acks.contains(&(index as u64)) {
                             let _ = result.insert(pk.clone());
                         }
                     }
                 }
             }
-            Phase::Finalization => {
+            Phase::Finalize => {
                 // Not blocking
             }
         }
         result
     }
 
-    /// Handles a `Part`, returns a `PartFault` if it is invalid.
-    fn handle_part_or_fault(
+    /// Handles a `Contribution`, returns a `ContributionFault` if it is invalid.
+    fn handle_contribution_or_fault(
         &mut self,
         sender_index: u64,
-        Part {
-            receiver,
-            commitment,
+        Contribution {
+            consumer,
+            consumable_commitment,
             ser_row,
             enc_rows,
-        }: Part,
-    ) -> Result<Option<Poly>, PartFault> {
+        }: Contribution,
+    ) -> Result<Option<Poly>, ContributionFault> {
         if enc_rows.len() != self.pub_keys.len() {
-            return Err(PartFault::RowCount);
+            return Err(ContributionFault::RowCount);
         }
-        if receiver != self.our_index {
+        if consumer != self.our_index {
             return Ok(None);
         }
-        if let Some(state) = self.parts.get(&sender_index) {
-            if state.commitment != commitment {
-                return Err(PartFault::MultipleParts);
+        if let Some(contribution_tracker) = self.contribution_trackers.get(&sender_index) {
+            if contribution_tracker.commitment_from_contribution != consumable_commitment {
+                return Err(ContributionFault::MultipleContributions);
             }
-            return Ok(None); // We already handled this `Part` before.
+            return Ok(None); // We already handled this `Contribution` before.
         }
-        let ack_row = commitment.row(self.our_index + 1);
+        let ack_row = consumable_commitment.row(self.our_index + 1);
         // Retrieve our own row's commitment, and store the full commitment.
         let _ = self
-            .parts
-            .insert(sender_index, ProposalState::new(commitment));
+            .contribution_trackers
+            .insert(sender_index, ContributionTracker::new(consumable_commitment));
 
-        let row: Poly = deserialize(&ser_row).map_err(|_| PartFault::DeserializeRow)?;
+        let row: Poly = deserialize(&ser_row).map_err(|_| ContributionFault::DeserializeRow)?;
         if row.commitment() != ack_row {
-            return Err(PartFault::RowAcknowledgment);
+            return Err(ContributionFault::RowAcknowledgment);
         }
         Ok(Some(row))
     }
@@ -966,20 +966,20 @@ impl<S: SecretId> KeyGen<S> {
     fn handle_ack_or_fault(
         &mut self,
         sender_index: u64,
-        Acknowledgment(proposer_index, receiver_index, ser_val, values): Acknowledgment,
+        Acknowledgment(contributor_index, consumer_index, ser_val, values): Acknowledgment,
     ) -> Result<(), AcknowledgmentFault> {
         if values.len() != self.pub_keys.len() {
             return Err(AcknowledgmentFault::ValueCount);
         }
-        if receiver_index != self.our_index {
+        if consumer_index != self.our_index {
             return Ok(());
         }
         {
-            let part = self
-                .parts
-                .get_mut(&proposer_index)
-                .ok_or(AcknowledgmentFault::MissingPart)?;
-            if !part.acks.insert(sender_index) {
+            let contribution_tracker = self
+                .contribution_trackers
+                .get_mut(&contributor_index)
+                .ok_or(AcknowledgmentFault::MissingContribution)?;
+            if !contribution_tracker.acks.insert(sender_index) {
                 return Ok(()); // We already handled this `Acknowledgment` before.
             }
             let our_index = self.our_index;
@@ -987,19 +987,19 @@ impl<S: SecretId> KeyGen<S> {
             let val = deserialize::<FieldWrap<Fr>>(&ser_val)
                 .map_err(|_| AcknowledgmentFault::DeserializeValue)?
                 .into_inner();
-            if part.commitment.evaluate(our_index + 1, sender_index + 1) != G1Affine::one().mul(val)
+            if contribution_tracker.commitment_from_contribution.evaluate(our_index + 1, sender_index + 1) != G1Affine::one().mul(val)
             {
                 return Err(AcknowledgmentFault::ValueAcknowledgment);
             }
-            let _ = part.values.insert(sender_index + 1, val);
+            let _ = contribution_tracker.verified_values.insert(sender_index + 1, val);
         }
 
         {
-            let part = self
-                .parts
+            let contribution_tracker = self
+                .contribution_trackers
                 .get_mut(&sender_index)
-                .ok_or(AcknowledgmentFault::MissingPart)?;
-            part.enc_values = values;
+                .ok_or(AcknowledgmentFault::MissingContribution)?;
+            contribution_tracker.enc_values = values;
         }
 
         Ok(())
@@ -1035,7 +1035,7 @@ impl<S: SecretId> KeyGen<S> {
             our_index,
             pub_keys: pub_keys.clone(),
             encryptor: Encryptor::new(&pub_keys),
-            parts: BTreeMap::new(),
+            contribution_trackers: BTreeMap::new(),
             threshold,
             phase,
             initalization_accumulator: InitializationAccumulator::new(),
@@ -1054,9 +1054,9 @@ pub enum AcknowledgmentFault {
     /// The number of values differs from the number of nodes.
     #[error(display = "The number of values differs from the number of nodes")]
     ValueCount,
-    /// No corresponding Part received.
-    #[error(display = "No corresponding Part received")]
-    MissingPart,
+    /// No corresponding Contribution received.
+    #[error(display = "No corresponding Contribution received")]
+    MissingContribution,
     /// Value decryption failed.
     #[error(display = "Value decryption failed")]
     DecryptValue,
@@ -1068,22 +1068,22 @@ pub enum AcknowledgmentFault {
     ValueAcknowledgment,
 }
 
-/// `Part` faulty entries.
+/// `Contribution` faulty entries.
 #[derive(
     Clone, Copy, Eq, err_derive::Error, PartialEq, Debug, Serialize, Deserialize, PartialOrd, Ord,
 )]
-pub enum PartFault {
+pub enum ContributionFault {
     /// The number of rows differs from the number of nodes.
     #[error(display = "The number of rows differs from the number of nodes")]
     RowCount,
     /// Received multiple different Part messages from the same sender.
-    #[error(display = "Received multiple different Part messages from the same sender")]
-    MultipleParts,
-    /// Could not decrypt our row in the Part message.
-    #[error(display = "Could not decrypt our row in the Part message")]
+    #[error(display = "Received multiple different Contribution messages from the same contributor")]
+    MultipleContributions,
+    /// Could not decrypt our row in the Contribution message.
+    #[error(display = "Could not decrypt our row in the Contribution message")]
     DecryptRow,
-    /// Could not deserialize our row in the Part message.
-    #[error(display = "Could not deserialize our row in the Part message")]
+    /// Could not deserialize our row in the Contribution message.
+    #[error(display = "Could not deserialize our row in the Contribution message")]
     DeserializeRow,
     /// Row does not match the ack.
     #[error(display = "Row does not match the ack")]
